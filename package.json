@@ -1,0 +1,35 @@
+{
+  "name": "art.arteditor.gami-prefab-importer",
+  "version": "3.0.1",
+  "displayName": "Gami Prefab Importer",
+  "description": "Convert button images from ArtEditor.art into Unity UI Prefabs with 9-slice sprites, Button components, and TextMeshPro labels. 100% free. No account required. No network calls. Drag-and-drop ready for any Canvas.",
+  "unity": "2022.3",
+  "documentationUrl": "https://arteditor.art",
+  "changelogUrl": "https://arteditor.art",
+  "licensesUrl": "https://arteditor.art",
+  "dependencies": {
+    "com.unity.textmeshpro": "3.0.6"
+  },
+  "keywords": [
+    "ui",
+    "button",
+    "prefab",
+    "9-slice",
+    "importer",
+    "tmp",
+    "textmeshpro",
+    "arteditor"
+  ],
+  "author": {
+    "name": "Brave Games",
+    "email": "immortalsapp@gmail.com",
+    "url": "https://arteditor.art"
+  },
+  "samples": [
+    {
+      "displayName": "Basic UI Demo",
+      "description": "Sample scene with pre-generated button prefabs showing 9-slice setup and TextMeshPro integration.",
+      "path": "Samples~/BasicUIDemo"
+    }
+  ]
+}
