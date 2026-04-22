@@ -1,34 +1,35 @@
 {
   "name": "art.arteditor.gami-prefab-importer",
-  "version": "3.0.1",
+  "version": "4.0.0",
   "displayName": "Gami Prefab Importer",
-  "description": "Convert button images from ArtEditor.art into Unity UI Prefabs with 9-slice sprites, Button components, and TextMeshPro labels. 100% free. No account required. No network calls. Drag-and-drop ready for any Canvas.",
+  "description": "Import ZIP packages exported from Brave Games web tools (Batch 9-Slice to Prefab Generator, PSD to Unity Prefabs, Nav Button Generator) into your Unity project as ready-to-use UI prefabs. Free edition - no account, no network calls, fully local. Visit https://arteditor.art to generate ZIPs.",
   "unity": "2022.3",
-  "documentationUrl": "https://arteditor.art",
-  "changelogUrl": "https://arteditor.art",
-  "licensesUrl": "https://arteditor.art",
+  "unityRelease": "0f1",
+  "documentationUrl": "https://github.com/seanqiubrave/GamiPrefabImport-UNITY",
+  "changelogUrl": "https://github.com/seanqiubrave/GamiPrefabImport-UNITY/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/seanqiubrave/GamiPrefabImport-UNITY/blob/main/LICENSE.md",
   "dependencies": {
     "com.unity.textmeshpro": "3.0.6"
   },
   "keywords": [
     "ui",
-    "button",
     "prefab",
-    "9-slice",
     "importer",
-    "tmp",
-    "textmeshpro",
-    "arteditor"
+    "9-slice",
+    "psd",
+    "nav-button",
+    "editor-tool",
+    "brave-games"
   ],
   "author": {
     "name": "Brave Games",
-    "email": "immortalsapp@gmail.com",
+    "email": "support@arteditor.art",
     "url": "https://arteditor.art"
   },
   "samples": [
     {
       "displayName": "Basic UI Demo",
-      "description": "Sample scene with pre-generated button prefabs showing 9-slice setup and TextMeshPro integration.",
+      "description": "Example scene with imported Gami tile buttons demonstrating PLAY and EXIT button setup.",
       "path": "Samples~/BasicUIDemo"
     }
   ]

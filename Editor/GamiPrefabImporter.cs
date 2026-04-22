@@ -1,8 +1,47 @@
-// GamiPrefabImporter.cs  v3.0.1
+// GamiPrefabImporter.cs  v4.0.0
 // Place in: Assets/GamiPrefabImport/Editor/
 //
 // Free Edition — Brave Games
 //
+// v4.0.0 — Package structure: ship GamiButton.cs + GamiTabGroup.cs as Runtime scripts.
+//           • New Runtime/ folder with BraveGames.GamiPrefabImport.Runtime.asmdef
+//             so Nav Button Generator ZIPs import cleanly on a fresh project
+//             (no longer requires users to install the button tool separately).
+//           • GamiTabGroup inspector preview split into Editor/GamiTabGroupEditor.cs.
+//           • Runtime scripts remain in the global namespace so the importer's
+//             reflection-based FindRuntimeType() keeps working unchanged.
+//           • Breaking: users who had their own copy of GamiButton.cs /
+//             GamiTabGroup.cs in Assets/ must delete the duplicates after update.
+// v3.3.0 — Nav-button fixes:
+//           • Removed fontSize * 0.75f multiplier (was shrinking text 25%).
+//             Font size now uses raw value from layout.json as-is.
+//           • Read "click_effect" ("grow" | "pop") per-button from layout.json
+//             and apply it to GamiButton.clickEffect during post-process bake.
+//             Default = "grow" (legacy behavior) when field absent.
+// v3.2.3 — Skip hidden layers entirely (was SetActive(false), now return 0).
+// v3.2.4 — anchoredPosition from rectTransform in layout.json (fixes multi-layer positions):
+//           • Button RT: anchor=center(0.5,0.5), pivot=(0.5,0.5), pos=(0,0),
+//             sizeDelta=(rect.width, rect.height). Matches standard prefab layout.
+//           • Text RT: stretch anchor (0,0)→(1,1), pivot=(0.5,0.5), padding
+//             Left=28 Top=14 Right=28 Bottom=34 (matches game button standard).
+//             Auto-size enabled (min=18, max=fontSize from PSD).
+//           • Text content forced ToUpper() — PSD "All Caps" style is preserved.
+//           • Font matching: FindTMPFont() searches project for TMP_FontAsset
+//             matching fontFamily name (exact then partial first-word match).
+//           • Root RT also uses center anchor (0.5,0.5) to match prefab standard.
+// v3.2.1 — Text layer fix: reads node.text for fontSize/color/alignment/fontStyle.
+//           • Reads `layers[]` flat array (primary) with fallback to rootNode tree.
+//           • Asset lookup: tries asset.assetId then asset.id (both valid).
+//           • 9-slice: spriteBorder now correctly set to compact-PNG-local coords
+//             (L/R = compLeftB, T/B = outTopB/outBottomB from gradient refiner).
+//             sizeDelta uses rect.width/height (original PSD layer size), not
+//             the compact PNG size, so UI element renders at correct PSD scale.
+//           • Visible flag respected when building hierarchy from layers[].
+// v3.1.0 — NEW: PSD Prefab path (additive). Detects ZIPs produced by
+//           Gami PSD → Prefab (PsdToPrefab.html) via a "format":"gami-psd-prefab"
+//           marker in layout.json and builds a Unity UI hierarchy that
+//           preserves the PSD's layer tree 1:1. Existing GamiPrefabEditor
+//           and Batch Button paths are untouched.
 // v3.0.1 — Fixed Unity 2022.3 compatibility (TextMeshPro 3.0.6 API).
 // v3.0.0 — Free Edition. Removed all account / credit / payment logic.
 //           Pure local ZIP-to-Prefab converter. No network calls. No tracking.
@@ -22,7 +61,7 @@ namespace BraveGames.GamiPrefabImport.Editor
 {
     public class GamiPrefabImporter : EditorWindow
     {
-        private const string VERSION = "3.0.1";
+        private const string VERSION = "4.0.0";
 
         [MenuItem("Tools/Gami Prefab Importer")]
         public static void ShowWindow()
@@ -270,6 +309,23 @@ namespace BraveGames.GamiPrefabImport.Editor
             bool hasLayoutJson = outerEntries.ContainsKey("layout.json");
             bool hasInnerZips = AnyEndsWith(outerEntries, ".zip");
 
+            // ─── PSD Prefab path (v3.1.0+) ──────────────────────────────
+            // Detects ZIPs produced by PsdToPrefab.html. Uses a "format"
+            // marker in layout.json so it's unambiguous and additive.
+            if (hasLayoutJson && !hasInnerZips)
+            {
+                string psdProbeText = Encoding.UTF8.GetString(outerEntries["layout.json"]);
+                if (psdProbeText.Contains("\"format\"") && psdProbeText.Contains("\"gami-psd-prefab\""))
+                {
+                    ALog("Format detected: PSD Prefab (gami-psd-prefab)");
+                    string stem = Path.GetFileNameWithoutExtension(_zipPath).Replace("_ui", "");
+                    ImportPsdPrefab(outerEntries, stem);
+                    AssetDatabase.Refresh();
+                    ALog("=== Import COMPLETE ===");
+                    return;
+                }
+            }
+
             if (hasLayoutJson && !hasInnerZips)
             {
                 string jsonText = Encoding.UTF8.GetString(outerEntries["layout.json"]);
@@ -463,6 +519,489 @@ namespace BraveGames.GamiPrefabImport.Editor
             var fp = so.FindProperty("m_Colors.m_FadeDuration");
             if (fp != null) fp.floatValue = 0.08f;
             so.ApplyModifiedPropertiesWithoutUndo();
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        //  PSD PREFAB IMPORT   (v3.1.0)
+        //  Consumes ZIPs produced by PsdToPrefab.html. Preserves the PSD's
+        //  layer tree 1:1 as a Unity UI hierarchy under Assets/GamiPrefabImport/Psd/.
+        //  Groups → RectTransform parents, pixel/shape → Image, text → TMP,
+        //  Btn_* named groups → Button component.
+        // ─────────────────────────────────────────────────────────────────
+        private const string PSD_DIR        = "Assets/GamiPrefabImport/Psd";
+        private const string PSD_SPRITE_DIR = "Assets/GamiPrefabImport/Psd/Sprites";
+
+        private void ImportPsdPrefab(Dictionary<string, byte[]> entries, string stem)
+        {
+            if (!entries.ContainsKey("layout.json")) { ALog("ERROR: layout.json missing"); return; }
+            var layout = MiniJson.Deserialize(Encoding.UTF8.GetString(entries["layout.json"])) as Dictionary<string, object>;
+            if (layout == null) { ALog("ERROR: layout.json parse failed"); return; }
+
+            var csz = GetDict(layout, "canvasSize");
+            float rootW = csz != null ? GetF(csz, "width",  512f) : 512f;
+            float rootH = csz != null ? GetF(csz, "height", 512f) : 512f;
+            ALog($"PSD canvas: {rootW}x{rootH}");
+
+            // 1. Write all PNGs into Psd/Sprites/ and configure as Sprite textures
+            Directory.CreateDirectory(PSD_DIR);
+            Directory.CreateDirectory(PSD_SPRITE_DIR);
+            AssetDatabase.Refresh();
+
+            var spriteMap = new Dictionary<string, Sprite>();
+            int writtenPng = 0;
+            foreach (var kv in entries)
+            {
+                if (!kv.Key.StartsWith("assets/", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!kv.Key.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) continue;
+                string fn = Path.GetFileName(kv.Key);
+                string assetPath = $"{PSD_SPRITE_DIR}/{fn}";
+                File.WriteAllBytes(Path.GetFullPath(assetPath), kv.Value);
+                writtenPng++;
+                DLog($"Wrote {assetPath} ({kv.Value.Length}B)");
+            }
+            AssetDatabase.Refresh();
+
+            // Reimport each as a Sprite so loading via LoadAssetAtPath<Sprite> works
+            foreach (var kv in entries)
+            {
+                if (!kv.Key.StartsWith("assets/", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!kv.Key.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) continue;
+                string fn = Path.GetFileName(kv.Key);
+                string assetPath = $"{PSD_SPRITE_DIR}/{fn}";
+                var ti = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+                if (ti != null)
+                {
+                    ti.textureType        = TextureImporterType.Sprite;
+                    ti.spriteImportMode   = SpriteImportMode.Single;
+                    ti.alphaIsTransparency = true;
+                    ti.mipmapEnabled      = false;
+                    ti.SaveAndReimport();
+                }
+                string id = Path.GetFileNameWithoutExtension(fn);
+                var sp = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
+                if (sp != null) spriteMap[id] = sp;
+            }
+            ALog($"Sprites ready: {spriteMap.Count} / {writtenPng}");
+
+            // 2. Build hierarchy.
+            // Prefer flat layers[] (v1.4.5+ schema) — carries rect (original PSD bounds)
+            // and spriteMetaData directly. Falls back to rootNode tree for older ZIPs.
+            string prefabPath = $"{PSD_DIR}/{SanitizeFilename(stem)}.prefab";
+            var root = new GameObject(SanitizeFilename(stem));
+            var rootRT = root.AddComponent<RectTransform>();
+            // Standard button prefab layout: center anchor, pos=0, size=canvas
+            rootRT.anchorMin        = new Vector2(0.5f, 0.5f);
+            rootRT.anchorMax        = new Vector2(0.5f, 0.5f);
+            rootRT.pivot            = new Vector2(0.5f, 0.5f);
+            rootRT.anchoredPosition = Vector2.zero;
+            rootRT.sizeDelta        = new Vector2(rootW, rootH);
+
+            int built = 0;
+            var flatLayers = GetList(layout, "layers");
+            if (flatLayers != null && flatLayers.Count > 0)
+            {
+                DLog($"Using flat layers[] path ({flatLayers.Count} entries)");
+                foreach (var item in flatLayers)
+                {
+                    if (item is Dictionary<string, object> node)
+                        built += BuildPsdNodeFlat(node, root.transform, spriteMap, rootH, rootW);
+                }
+            }
+            else
+            {
+                // Legacy: rootNode tree walk
+                var rootNode = GetDict(layout, "rootNode");
+                if (rootNode == null) { ALog("ERROR: no layers[] and no rootNode found"); return; }
+                DLog("Using legacy rootNode tree path");
+                var rootKids = GetList(rootNode, "children");
+                if (rootKids != null)
+                {
+                    foreach (var c in rootKids)
+                    {
+                        if (c is Dictionary<string, object> cd)
+                            built += BuildPsdNode(cd, root.transform, spriteMap, rootH);
+                    }
+                }
+            }
+            ALog($"Layers built: {built}");
+
+            // 3. Save prefab
+            if (File.Exists(prefabPath))
+            {
+                AssetDatabase.DeleteAsset(prefabPath);
+                AssetDatabase.Refresh();
+            }
+            PrefabUtility.SaveAsPrefabAsset(root, prefabPath);
+            UnityEngine.Object.DestroyImmediate(root);
+            ALog($"PSD prefab: {prefabPath}  ({rootW}x{rootH})");
+        }
+
+        // ── Flat layers[] builder (v1.4.5+ layout.json) ──────────────────
+        // Reads name/type/rect/asset/spriteMetaData from each flat node.
+        // sizeDelta comes from rect (original PSD layer bounds), not compact PNG.
+        // spriteBorder values are compact-PNG-local coords from PsdToPrefab v1.6.3+.
+        private int BuildPsdNodeFlat(Dictionary<string, object> node, Transform parent,
+                                     Dictionary<string, Sprite> spriteMap, float canvasH,
+                                     float canvasW = 0f)
+        {
+            if (node == null) return 0;
+            string name    = GetStr(node, "name") ?? "layer";
+            string type    = GetStr(node, "type") ?? "image";
+            bool   visible = !node.ContainsKey("visible") || (node["visible"] is bool bv ? bv : true);
+            float  opacity = GetF(node, "opacity", 1f);
+
+            // Skip hidden layers entirely — don't create a GameObject at all.
+            if (!visible) return 0;
+
+            var go = new GameObject(string.IsNullOrEmpty(name) ? "layer" : name);
+            go.transform.SetParent(parent, false);
+
+            var rt = go.AddComponent<RectTransform>();
+            var rectJson = GetDict(node, "rect");
+            float rx = 0, ry = 0, rw = 100, rh = 100;
+            if (rectJson != null)
+            {
+                rx = GetF(rectJson, "x", 0f);
+                ry = GetF(rectJson, "y", 0f);
+                rw = GetF(rectJson, "width", 100f);
+                rh = GetF(rectJson, "height", 100f);
+            }
+
+            int count = 1;
+
+            if (type == "text")
+            {
+                // Text: stretch anchor fills parent, with padding matching button borders.
+                // This mirrors the standard game UI layout (Image 4):
+                //   anchorMin=(0,0)  anchorMax=(1,1)  pivot=(0.5,0.5)
+                //   offsetMin=(padL, padB)  offsetMax=(-padR, -padT)
+                rt.anchorMin = Vector2.zero;
+                rt.anchorMax = Vector2.one;
+                rt.pivot     = new Vector2(0.5f, 0.5f);
+                // Default padding values (matches typical button border ~26-28px)
+                float padL = 28f, padR = 28f, padT = 14f, padB = 34f;
+                rt.offsetMin = new Vector2(padL,  padB);   // left, bottom
+                rt.offsetMax = new Vector2(-padR, -padT);  // -right, -top
+
+                var tmp = go.AddComponent<TextMeshProUGUI>();
+                var txt = GetDict(node, "text") ?? GetDict(node, "textComponent");
+                string content = txt != null ? (GetStr(txt, "content") ?? name) : name;
+                // Force uppercase to match PSD display (Photoshop All Caps style)
+                tmp.text               = content.ToUpper();
+                tmp.enableWordWrapping = true;
+                tmp.raycastTarget      = false;
+                tmp.enableAutoSizing   = true;
+                tmp.fontSizeMin        = 18f;
+                tmp.fontSizeMax        = txt != null ? GetF(txt, "fontSize", 75f) : 75f;
+
+                // Alignment — center both axes
+                tmp.alignment = TextAlignmentOptions.Center;
+
+                // Color
+                var tc = txt != null ? GetDict(txt, "color") : null;
+                tmp.color = tc != null
+                    ? new Color(GetF(tc,"r",0f), GetF(tc,"g",0f), GetF(tc,"b",0f),
+                                GetF(tc,"a",1f) * Mathf.Clamp01(opacity))
+                    : new Color(0f, 0f, 0f, Mathf.Clamp01(opacity));
+
+                // Font style
+                string fontStyle = txt != null ? (GetStr(txt, "fontStyle") ?? "normal") : "normal";
+                tmp.fontStyle = fontStyle == "bold"        ? FontStyles.Bold :
+                                fontStyle == "italic"      ? FontStyles.Italic :
+                                fontStyle == "bold-italic" ? FontStyles.Bold | FontStyles.Italic :
+                                                             FontStyles.Normal;
+
+                // Font matching: search project for TMP_FontAsset matching fontFamily name
+                string fontFamily = txt != null ? (GetStr(txt, "fontFamily") ?? "") : "";
+                if (!string.IsNullOrEmpty(fontFamily))
+                {
+                    var fontAsset = FindTMPFont(fontFamily);
+                    if (fontAsset != null) tmp.font = fontAsset;
+                }
+            }
+            else
+            {
+                // Image/button node: position from layout.json rectTransform.anchoredPosition
+                // (computed by PsdToPrefab v3.2.4+ relative to canvas center, Y-up).
+                // Fallback: compute from rect + canvasSize for older exports.
+                rt.anchorMin = new Vector2(0.5f, 0.5f);
+                rt.anchorMax = new Vector2(0.5f, 0.5f);
+                rt.pivot     = new Vector2(0.5f, 0.5f);
+
+                var rtJson = GetDict(node, "rectTransform");
+                if (rtJson != null && rtJson.ContainsKey("anchoredPosition"))
+                {
+                    var ap = GetDict(rtJson, "anchoredPosition");
+                    var sd = GetDict(rtJson, "sizeDelta");
+                    rt.anchoredPosition = new Vector2(
+                        ap != null ? GetF(ap, "x", 0f) : 0f,
+                        ap != null ? GetF(ap, "y", 0f) : 0f);
+                    rt.sizeDelta = new Vector2(
+                        sd != null ? GetF(sd, "x", rw) : rw,
+                        sd != null ? GetF(sd, "y", rh) : rh);
+                }
+                else
+                {
+                    // Fallback: derive position from PSD rect + canvas center
+                    float cw = canvasW > 0f ? canvasW : canvasH; // square fallback
+                    float ch = canvasH;
+                    float cx = rx + rw / 2f;
+                    float cy = ry + rh / 2f;
+                    rt.anchoredPosition = new Vector2(cx - cw / 2f, -(cy - ch / 2f));
+                    rt.sizeDelta        = new Vector2(rw, rh);
+                }
+
+                // Resolve sprite
+                var asset = GetDict(node, "asset");
+                Sprite sp = null;
+                if (asset != null)
+                {
+                    string aid = GetStr(asset, "assetId") ?? GetStr(asset, "id");
+                    if (!string.IsNullOrEmpty(aid) && spriteMap.TryGetValue(aid, out var s)) sp = s;
+                }
+
+                if (sp != null)
+                {
+                    var img = go.AddComponent<Image>();
+                    img.sprite = sp;
+                    img.color  = new Color(1f, 1f, 1f, Mathf.Clamp01(opacity));
+
+                    var smd = GetDict(node, "spriteMetaData");
+                    if (smd != null && smd.ContainsKey("border"))
+                    {
+                        var border = smd["border"] as List<object>;
+                        if (border != null && border.Count == 4)
+                        {
+                            float L = ToF(border[0]), B = ToF(border[1]),
+                                  R = ToF(border[2]), T = ToF(border[3]);
+                            if (L > 0 || R > 0 || T > 0 || B > 0)
+                            {
+                                string spPath = AssetDatabase.GetAssetPath(sp);
+                                var ti = AssetImporter.GetAtPath(spPath) as TextureImporter;
+                                if (ti != null)
+                                {
+                                    ti.spriteBorder        = new Vector4(L, B, R, T);
+                                    ti.spritePixelsPerUnit = GetF(smd, "pixelsPerUnit", 100f);
+                                    ti.SaveAndReimport();
+                                    var reloaded = AssetDatabase.LoadAssetAtPath<Sprite>(spPath);
+                                    if (reloaded != null) { img.sprite = reloaded; sp = reloaded; }
+                                }
+                                img.type       = Image.Type.Sliced;
+                                img.fillCenter = true;
+                            }
+                        }
+                    }
+                }
+
+                bool isButton = type == "button" ||
+                                name.StartsWith("Btn_",    StringComparison.OrdinalIgnoreCase) ||
+                                name.StartsWith("Button_", StringComparison.OrdinalIgnoreCase);
+                if (isButton)
+                {
+                    var btn = go.AddComponent<Button>();
+                    var img = go.GetComponent<Image>();
+                    if (img != null) btn.targetGraphic = img;
+                    ApplyBatchButtonColors(btn);
+                    if (node.ContainsKey("interactable") && node["interactable"] is bool ib)
+                        btn.interactable = ib;
+                }
+
+                var kids = GetList(node, "children");
+                if (kids != null)
+                {
+                    foreach (var c in kids)
+                    {
+                        if (c is Dictionary<string, object> cd)
+                            count += BuildPsdNodeFlat(cd, go.transform, spriteMap, canvasH, canvasW);
+                    }
+                }
+            }
+
+            return count;
+        }
+
+        // Find a TMP_FontAsset in the project whose name contains the given fontFamily string.
+        // Tries exact match first, then partial match (case-insensitive).
+        private static TMP_FontAsset FindTMPFont(string fontFamily)
+        {
+            if (string.IsNullOrEmpty(fontFamily)) return null;
+            string lower = fontFamily.ToLower();
+            var guids = AssetDatabase.FindAssets("t:TMP_FontAsset");
+            TMP_FontAsset partial = null;
+            foreach (var guid in guids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                string fname = Path.GetFileNameWithoutExtension(path).ToLower();
+                if (fname == lower)
+                    return AssetDatabase.LoadAssetAtPath<TMP_FontAsset>(path); // exact match
+                if (partial == null && fname.Contains(lower.Split(' ')[0])) // first word match
+                    partial = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>(path);
+            }
+            return partial;
+        }
+
+        // Recursively walks a PSD-Prefab JSON node. Returns number of GameObjects built.
+        private int BuildPsdNode(Dictionary<string, object> node, Transform parent,
+                                 Dictionary<string, Sprite> spriteMap, float canvasH)
+        {
+            if (node == null) return 0;
+            string name    = GetStr(node, "name") ?? "layer";
+            string type    = GetStr(node, "type") ?? "image";
+            bool   visible = !node.ContainsKey("visible") || (node["visible"] is bool b ? b : true);
+            float  opacity = GetF(node, "opacity", 1f);
+
+            // Clean name for Unity GameObject — only strip truly problematic chars,
+            // keep non-ASCII (Chinese, Japanese, etc.) intact since Unity GameObjects accept them.
+            string goName = string.IsNullOrEmpty(name) ? "layer" : name;
+
+            // Skip hidden layers entirely.
+            if (!visible) return 0;
+
+            var go = new GameObject(goName);
+            go.transform.SetParent(parent, false);
+
+            var rt = go.AddComponent<RectTransform>();
+            // Prefer explicit rectTransform if present; else derive from rect
+            var rtJson = GetDict(node, "rectTransform");
+            var rectJson = GetDict(node, "rect");
+            float rx = 0, ry = 0, rw = 10, rh = 10;
+            if (rectJson != null)
+            {
+                rx = GetF(rectJson, "x", 0f);
+                ry = GetF(rectJson, "y", 0f);
+                rw = GetF(rectJson, "width", 10f);
+                rh = GetF(rectJson, "height", 10f);
+            }
+            // Unity UI layout: anchor to top-left so we can position with x, -y directly
+            rt.anchorMin = new Vector2(0f, 1f);
+            rt.anchorMax = new Vector2(0f, 1f);
+            rt.pivot     = new Vector2(0f, 1f);
+            if (rtJson != null)
+            {
+                var pos = GetDict(rtJson, "position");
+                var siz = GetDict(rtJson, "size");
+                float px = pos != null ? GetF(pos, "x", rx) : rx;
+                float py = pos != null ? GetF(pos, "y", -ry) : -ry;
+                float sw = siz != null ? GetF(siz, "width",  rw) : rw;
+                float sh = siz != null ? GetF(siz, "height", rh) : rh;
+                rt.anchoredPosition = new Vector2(px, py);
+                rt.sizeDelta        = new Vector2(sw, sh);
+            }
+            else
+            {
+                rt.anchoredPosition = new Vector2(rx, -ry);
+                rt.sizeDelta        = new Vector2(rw, rh);
+            }
+
+            int count = 1;
+
+            // Text node
+            if (type == "text")
+            {
+                var tmp = go.AddComponent<TextMeshProUGUI>();
+                var txt = GetDict(node, "text");
+                tmp.text           = txt != null ? (GetStr(txt, "content") ?? name) : name;
+                tmp.fontSize       = txt != null ? GetF(txt, "fontSize", 16f) : 16f;
+                tmp.enableWordWrapping = true;
+                tmp.alignment      = TextAlignmentOptions.Center;
+                tmp.raycastTarget  = false;
+                // Text colour
+                var tc = txt != null ? GetDict(txt, "color") : null;
+                if (tc != null)
+                {
+                    tmp.color = new Color(
+                        GetF(tc, "r", 1f), GetF(tc, "g", 1f),
+                        GetF(tc, "b", 1f), GetF(tc, "a", 1f) * Mathf.Clamp01(opacity));
+                }
+                else
+                {
+                    var c = tmp.color; c.a *= Mathf.Clamp01(opacity); tmp.color = c;
+                }
+            }
+            else
+            {
+                // Image node (pixel, shape, panel, bg, icon, button, etc.)
+                var asset = GetDict(node, "asset");
+                Sprite sp = null;
+                if (asset != null)
+                {
+                    string aid = GetStr(asset, "assetId");
+                    if (!string.IsNullOrEmpty(aid) && spriteMap.TryGetValue(aid, out var s)) sp = s;
+                }
+
+                // Only add an Image if we have a sprite. Pure container groups skip Image.
+                if (sp != null)
+                {
+                    var img = go.AddComponent<Image>();
+                    img.sprite = sp;
+                    var col = Color.white;
+                    col.a = Mathf.Clamp01(opacity);
+                    img.color = col;
+
+                    // 9-slice if spriteMetaData present
+                    var smd = GetDict(node, "spriteMetaData");
+                    if (smd != null && smd.ContainsKey("border"))
+                    {
+                        var border = smd["border"] as List<object>;
+                        if (border != null && border.Count == 4)
+                        {
+                            float L = ToF(border[0]), B = ToF(border[1]),
+                                  R = ToF(border[2]), T = ToF(border[3]);
+                            if (L > 0 || R > 0 || T > 0 || B > 0)
+                            {
+                                // Sprite border needs to be set on the TextureImporter, not the sprite
+                                string spPath = AssetDatabase.GetAssetPath(sp);
+                                var ti = AssetImporter.GetAtPath(spPath) as TextureImporter;
+                                if (ti != null)
+                                {
+                                    ti.spriteBorder = new Vector4(L, B, R, T);
+                                    float ppu = GetF(smd, "pixelsPerUnit", 100f);
+                                    ti.spritePixelsPerUnit = ppu;
+                                    ti.SaveAndReimport();
+                                }
+                                img.type = Image.Type.Sliced;
+                            }
+                        }
+                    }
+                }
+
+                // Button component on Btn_*-named groups (or type=="button")
+                bool isButton = type == "button" ||
+                                goName.StartsWith("Btn_",    StringComparison.OrdinalIgnoreCase) ||
+                                goName.StartsWith("Button_", StringComparison.OrdinalIgnoreCase);
+                if (isButton)
+                {
+                    var btn = go.AddComponent<Button>();
+                    var img = go.GetComponent<Image>();
+                    if (img != null) btn.targetGraphic = img;
+                    ApplyBatchButtonColors(btn);
+
+                    // Honour interactable flag from JSON if present
+                    if (node.ContainsKey("interactable") && node["interactable"] is bool ib)
+                        btn.interactable = ib;
+                }
+
+                // Recurse into children
+                var kids = GetList(node, "children");
+                if (kids != null)
+                {
+                    foreach (var c in kids)
+                    {
+                        if (c is Dictionary<string, object> cd)
+                            count += BuildPsdNode(cd, go.transform, spriteMap, canvasH);
+                    }
+                }
+            }
+
+            return count;
+        }
+
+        private static string SanitizeFilename(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return "psd_prefab";
+            foreach (char c in Path.GetInvalidFileNameChars()) n = n.Replace(c, '_');
+            n = n.Trim();
+            return string.IsNullOrEmpty(n) ? "psd_prefab" : n;
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -771,9 +1310,9 @@ namespace BraveGames.GamiPrefabImport.Editor
                 textGO.transform.SetParent(btnGO.transform, false);
                 var tmp2 = textGO.AddComponent<TextMeshProUGUI>();
                 tmp2.text = btnLayer.label ?? "";
-                tmp2.fontSize = (btnLayer.font_size > 0 ? btnLayer.font_size : 36f) * 0.75f;
+                tmp2.fontSize = btnLayer.font_size > 0 ? btnLayer.font_size : 36f;
                 tmp2.fontStyle = FontStyles.Bold;
-                tmp2.alignment = TextAlignmentOptions.Center;
+                tmp2.alignment = TextAlignmentOptions.Bottom;
                 tmp2.enableWordWrapping = false;
                 tmp2.overflowMode = TextOverflowModes.Overflow;
                 var tRT = textGO.GetComponent<RectTransform>();
@@ -781,8 +1320,9 @@ namespace BraveGames.GamiPrefabImport.Editor
                 tRT.anchorMin = new Vector2(0, 0);
                 tRT.anchorMax = new Vector2(1, 0);
                 tRT.pivot = new Vector2(0.5f, 0);
-                tRT.offsetMin = new Vector2(0, 0);
-                tRT.offsetMax = new Vector2(0, tH);
+                float tOffY = btnLayer.text_offset_y;
+                tRT.offsetMin = new Vector2(0, tOffY);
+                tRT.offsetMax = new Vector2(0, tOffY + tH);
                 textGO.SetActive(false);
                 DLog($"  Built: {btnGO.name}");
             }
@@ -835,32 +1375,46 @@ namespace BraveGames.GamiPrefabImport.Editor
                     btn.colors = cb;
                     DLog($"  {btnT.name} ColorBlock applied");
                 }
-                if (aebType != null && isED && layer.logic_data?.states != null)
+                if (aebType != null && isED)
                 {
                     var aebComp = btnT.GetComponent(aebType);
                     if (aebComp != null)
                     {
                         var so = new SerializedObject(aebComp);
-                        var sdp = so.FindProperty("stateData");
-                        sdp.arraySize = layer.logic_data.states.Length;
-                        for (int s = 0; s < layer.logic_data.states.Length; s++)
+
+                        // Write clickEffect (v3.3.0+). Default "grow" if field absent.
+                        var cep = so.FindProperty("clickEffect");
+                        if (cep != null)
                         {
-                            var sj = layer.logic_data.states[s];
-                            var sp2 = sdp.GetArrayElementAtIndex(s);
-                            sp2.FindPropertyRelative("stateName").stringValue = sj.stateName;
-                            var cp = sp2.FindPropertyRelative("children");
-                            int cc = sj.children?.Length ?? 0;
-                            cp.arraySize = cc;
-                            for (int c = 0; c < cc; c++)
-                            {
-                                var cj = sj.children[c];
-                                var cpE = cp.GetArrayElementAtIndex(c);
-                                cpE.FindPropertyRelative("childName").stringValue = cj.childName;
-                                cpE.FindPropertyRelative("color").colorValue = HexToColor(cj.colorHex);
-                            }
+                            // enum: 0 = Grow, 1 = Pop (matches GamiButton.ClickEffect order)
+                            cep.enumValueIndex = (layer.click_effect == "pop") ? 1 : 0;
+                            DLog($"  {btnT.name} clickEffect={layer.click_effect}");
                         }
+
+                        if (layer.logic_data?.states != null)
+                        {
+                            var sdp = so.FindProperty("stateData");
+                            sdp.arraySize = layer.logic_data.states.Length;
+                            for (int s = 0; s < layer.logic_data.states.Length; s++)
+                            {
+                                var sj = layer.logic_data.states[s];
+                                var sp2 = sdp.GetArrayElementAtIndex(s);
+                                sp2.FindPropertyRelative("stateName").stringValue = sj.stateName;
+                                var cp = sp2.FindPropertyRelative("children");
+                                int cc = sj.children?.Length ?? 0;
+                                cp.arraySize = cc;
+                                for (int c = 0; c < cc; c++)
+                                {
+                                    var cj = sj.children[c];
+                                    var cpE = cp.GetArrayElementAtIndex(c);
+                                    cpE.FindPropertyRelative("childName").stringValue = cj.childName;
+                                    cpE.FindPropertyRelative("color").colorValue = HexToColor(cj.colorHex);
+                                }
+                            }
+                            DLog($"  {btnT.name} AEB stateData written");
+                        }
+
                         so.ApplyModifiedPropertiesWithoutUndo();
-                        DLog($"  {btnT.name} AEB stateData written");
                     }
                 }
             }
@@ -976,6 +1530,17 @@ namespace BraveGames.GamiPrefabImport.Editor
             };
             string rawDM = GetStr(d, "drive_mode") ?? "";
             lj.drive_mode = rawDM == "Editor Driver" ? "editor_driver" : "native";
+
+            // click_effect: "grow" (default) | "pop". Accepts top-level
+            // "click_effect" or "clickEffect", or nested "logic_data.click_effect"
+            // for forward-compat with whatever schema the web exporter settles on.
+            string ce = GetStr(d, "click_effect") ?? GetStr(d, "clickEffect");
+            if (string.IsNullOrEmpty(ce))
+            {
+                var rlogic = GetDict(d, "logic_data");
+                if (rlogic != null) ce = GetStr(rlogic, "click_effect") ?? GetStr(rlogic, "clickEffect");
+            }
+            lj.click_effect = string.IsNullOrEmpty(ce) ? "grow" : ce.ToLowerInvariant();
             var brt = GetDict(d, "rectTransform");
             if (brt != null)
             {
@@ -1066,8 +1631,10 @@ namespace BraveGames.GamiPrefabImport.Editor
                     {
                         var tsz = GetDict(trt, "size");
                         if (tsz != null) lj.text_height = GetF(tsz, "height", 50f);
+                        var tpos = GetDict(trt, "position");
+                        if (tpos != null) lj.text_offset_y = GetF(tpos, "y", 0f);
                     }
-                    DLog($"  Text: label='{lj.label}' fontSize={lj.font_size} textH={lj.text_height}");
+                    DLog($"  Text: label='{lj.label}' fontSize={lj.font_size} textH={lj.text_height} offsetY={lj.text_offset_y}");
                 }
             }
             if (lj.icon_w <= 0) lj.icon_w = 80f;
@@ -1128,8 +1695,9 @@ namespace BraveGames.GamiPrefabImport.Editor
         {
             public string id, name, type, parentId, drive_mode;
             public RectJson rect;
-            public float height, icon_w, icon_h, icon_pos_y, font_size, text_height;
+            public float height, icon_w, icon_h, icon_pos_y, font_size, text_height, text_offset_y;
             public string bg_color, bg_sprite_name, icon_sprite_name, label;
+            public string click_effect;   // "grow" | "pop"  (v3.3.0+)
             public SliceJson bg_sprite_slice;
             public UBJson unity_button;
             public LogicJson logic_data;

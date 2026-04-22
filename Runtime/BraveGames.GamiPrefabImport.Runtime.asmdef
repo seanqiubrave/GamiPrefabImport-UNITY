@@ -1,13 +1,10 @@
 {
-    "name": "BraveGames.GamiPrefabImport.Editor",
+    "name": "BraveGames.GamiPrefabImport.Runtime",
     "rootNamespace": "",
     "references": [
-        "BraveGames.GamiPrefabImport.Runtime",
         "Unity.TextMeshPro"
     ],
-    "includePlatforms": [
-        "Editor"
-    ],
+    "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
     "overrideReferences": false,
